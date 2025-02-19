@@ -30,3 +30,6 @@
 *.exe
 *.out
 *.app
+
+cuda_hook.gen.cc
+build*/
