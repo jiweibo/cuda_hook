@@ -14,6 +14,18 @@ CUDA_VDPAU_HEADER = "/usr/local/cuda/targets/x86_64-linux/include/cudaVDPAU.h"
 # CUDA_DBG_HEADER = "/usr/local/cuda/extras/Debugger/include/cudadebugger.h"
 
 
+def _canonical_func_name(func_name: str) -> str:
+    """
+    map cuMemcpyHtoDAsync_v2 / _v2_ptsz / _v3_xxx to cuMemcpyHtoDAsync.
+    """
+    _VERSION_RE = re.compile(r"_v\d+.*$")
+    _STREAM_SUFFIX_RE = re.compile(r"_(ptsz|ptds)$")
+
+    if "_v" in func_name:
+        return _VERSION_RE.sub("", func_name)
+    return _STREAM_SUFFIX_RE.sub("", func_name)
+
+
 def _extract_signatures(filename) -> List[Dict]:
     """
     extrace signatures from file.
@@ -29,6 +41,9 @@ def _extract_signatures(filename) -> List[Dict]:
     for cursor in tu.cursor.walk_preorder():
         if cursor.kind == CursorKind.FUNCTION_DECL:
             func_name = cursor.spelling
+            if not func_name.startswith("cu"):
+                continue
+
             ret_type = cursor.result_type.spelling
             args = []
             params = []
@@ -36,8 +51,22 @@ def _extract_signatures(filename) -> List[Dict]:
                 arg_type = arg.type.spelling
                 arg_name = arg.spelling
                 params.append({"name": arg_name, "type": arg_type})
-            func_obj = {"name": func_name, "return_type": ret_type, "params": params}
+            func_obj = {
+                "name": func_name,
+                "return_type": ret_type,
+                "params": params,
+            }
             signatures.append(func_obj)
+
+            # handle for xx_v2 / xx_v2_ptsz.
+            canonical_func_name = _canonical_func_name(func_name)
+            if canonical_func_name != func_name:
+                canonical_func_obj = {
+                    "name": canonical_func_name,
+                    "return_type": ret_type,
+                    "params": params,
+                }
+                signatures.append(canonical_func_obj)
     return signatures
 
 
@@ -88,16 +117,7 @@ HOOK_C_API HOOK_DECL_EXPORT {FUNC_RET_TYPE} {FUNC_NAME}({FUNC_ARGS}) {{
 """
     ori_func_name = func_name
     if func_name not in all_sigs:
-        func_name = func_name.replace("_v2", "")
-
-    if func_name not in all_sigs:
-        func_name = func_name.replace("_ptsz", "")
-
-    if func_name not in all_sigs:
-        func_name = func_name.replace("_ptds", "")
-
-    if func_name not in all_sigs:
-        func_name = func_name.replace("_v3", "")
+        func_name = _canonical_func_name(func_name)
 
     if func_name not in all_sigs:
         print(f"{func_name} cpp code not generate. Not found sig in header file.")
@@ -134,6 +154,88 @@ def main():
 
 constexpr const char* LIB_CUDA_SO{"/usr/lib/x86_64-linux-gnu/libcuda.so"};
 
+#undef cuDeviceTotalMem
+#undef cuCtxCreate
+#undef cuCtxCreate_v3
+#undef cuCtxCreate_v4
+#undef cuModuleGetGlobal
+#undef cuMemGetInfo
+#undef cuMemAlloc
+#undef cuMemAllocPitch
+#undef cuMemFree
+#undef cuMemGetAddressRange
+#undef cuMemAllocHost
+#undef cuMemHostGetDevicePointer
+#undef cuMemcpyHtoD
+#undef cuMemcpyDtoH
+#undef cuMemcpyDtoD
+#undef cuMemcpyDtoA
+#undef cuMemcpyAtoD
+#undef cuMemcpyHtoA
+#undef cuMemcpyAtoH
+#undef cuMemcpyAtoA
+#undef cuMemcpyHtoAAsync
+#undef cuMemcpyAtoHAsync
+#undef cuMemcpy2D
+#undef cuMemcpy2DUnaligned
+#undef cuMemcpy3D
+#undef cuMemcpyHtoDAsync
+#undef cuMemcpyDtoHAsync
+#undef cuMemcpyDtoDAsync
+#undef cuMemcpy2DAsync
+#undef cuMemcpy3DAsync
+#undef cuMemcpyBatchAsync
+#undef cuMemcpy3DBatchAsync
+#undef cuMemsetD8
+#undef cuMemsetD16
+#undef cuMemsetD32
+#undef cuMemsetD2D8
+#undef cuMemsetD2D16
+#undef cuMemsetD2D32
+#undef cuArrayCreate
+#undef cuArrayGetDescriptor
+#undef cuArray3DCreate
+#undef cuArray3DGetDescriptor
+#undef cuTexRefSetAddress
+#undef cuTexRefGetAddress
+#undef cuGraphicsResourceGetMappedPointer
+#undef cuCtxDestroy
+#undef cuCtxPopCurrent
+#undef cuCtxPushCurrent
+#undef cuStreamDestroy
+#undef cuEventDestroy
+#undef cuTexRefSetAddress2D
+#undef cuLinkCreate
+#undef cuLinkAddData
+#undef cuLinkAddFile
+#undef cuMemHostRegister
+#undef cuGraphicsResourceSetMapFlags
+#undef cuStreamBeginCapture
+#undef cuDevicePrimaryCtxRelease
+#undef cuDevicePrimaryCtxReset
+#undef cuDevicePrimaryCtxSetFlags
+#undef cuDeviceGetUuid_v2
+#undef cuIpcOpenMemHandle
+#undef cuGraphInstantiate
+#undef cuGraphExecUpdate
+#undef cuGetProcAddress
+#undef cuGraphAddKernelNode
+#undef cuGraphKernelNodeGetParams
+#undef cuGraphKernelNodeSetParams
+#undef cuGraphExecKernelNodeSetParams
+#undef cuStreamWriteValue32
+#undef cuStreamWaitValue32
+#undef cuStreamWriteValue64
+#undef cuStreamWaitValue64
+#undef cuStreamBatchMemOp
+#undef cuStreamGetCaptureInfo
+#undef cuStreamGetCaptureInfo_v2
+
+#undef cuGLCtxCreate
+#undef cuGLGetDevices
+#undef cuGLMapBufferObject
+#undef cuGLMapBufferObjectAsync
+
 class HookSingleton {
 public:
   static HookSingleton& GetInstance() {
@@ -153,7 +255,6 @@ private:
 
     all_sigs = _get_sig_from_headers()
     funcs = _get_funcs_from_lib()
-
     for func in funcs:
         code = _gen_cpp_code_for_func(func, all_sigs)
         if not code:
