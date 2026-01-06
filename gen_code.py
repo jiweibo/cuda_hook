@@ -1,11 +1,47 @@
-import subprocess
 import re
+import subprocess
+import sys
+from typing import Dict, List
+
+from clang.cindex import Config, CursorKind, Index
 
 LIB_CUDA_SO = "/usr/lib/x86_64-linux-gnu/libcuda.so"
 CUDA_HEADER = "/usr/local/cuda/include/cuda.h"
+CUDA_EGL_HEADER = "/usr/local/cuda/targets/x86_64-linux/include/cudaEGL.h"
+CUDA_GL_HEADER = "/usr/local/cuda/targets/x86_64-linux/include/cudaGL.h"
+CUDA_PROFILER_HEADER = "/usr/local/cuda/targets/x86_64-linux/include/cudaProfiler.h"
+CUDA_VDPAU_HEADER = "/usr/local/cuda/targets/x86_64-linux/include/cudaVDPAU.h"
+# CUDA_DBG_HEADER = "/usr/local/cuda/extras/Debugger/include/cudadebugger.h"
 
 
-def get_all_func():
+def _extract_signatures(filename) -> List[Dict]:
+    """
+    extrace signatures from file.
+
+    return [
+        {'name': 'cuCheckpointProcessLock', 'return_type': 'CUresult', 'params': [{'name': 'pid', 'type': 'int'}]},
+        ...
+    ]
+    """
+    index = Index.create()
+    tu = index.parse(filename, args=["-x", "c", "--target=x86_64-unknown-linux-gnu"])
+    signatures = []
+    for cursor in tu.cursor.walk_preorder():
+        if cursor.kind == CursorKind.FUNCTION_DECL:
+            func_name = cursor.spelling
+            ret_type = cursor.result_type.spelling
+            args = []
+            params = []
+            for arg in cursor.get_arguments():
+                arg_type = arg.type.spelling
+                arg_name = arg.spelling
+                params.append({"name": arg_name, "type": arg_type})
+            func_obj = {"name": func_name, "return_type": ret_type, "params": params}
+            signatures.append(func_obj)
+    return signatures
+
+
+def _get_funcs_from_lib():
     try:
         cmd = "nm -D {SO} | grep -i cu | awk '{{print $3}}'".format(SO=LIB_CUDA_SO)
         result = subprocess.run(
@@ -18,158 +54,80 @@ def get_all_func():
     return funcs.strip().split("\n")
 
 
-#
-# input : `CUresult CUDAAPI cuGetErrorString(CUresult error, const char **pStr);`
-# return: (CUresult, const char **), (error, pStr), [CUresult error, const char **pStr]
-#
-def get_sig_for(func):
-    cmd = f"sed -n ':start; /;$/!{{N; b start}}; /CUresult CUDAAPI.*{func}(/ {{p; /);/q}}' {CUDA_HEADER} | grep -A 20 'CUresult CUDAAPI' || true"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
-    sig = result.stdout.strip()
-    param_string_match = re.search(r"\((.*)\)", sig, re.DOTALL)
-    if not param_string_match:
-        # print(f'{func} sig not found, skip.')
-        return None
-    param_string = param_string_match.group(1)
-    raw_params = [param.strip() for param in param_string.split(",")]
-    param_types = []
-    param_names = []
-    for param in raw_params:
-        if param == "void":
-            param_types.append("void")
-            param_names.append("")
-        else:
-            param_pattern = r"(.+?)(\w+)$"
-            param_match = re.search(param_pattern, param)
-            if param_match:
-                raw_type = param_match.group(1).strip()
-                variable = param_match.group(2).strip()
-                param_types.append(raw_type)
-                param_names.append(variable)
-            else:
-                print(f"parse params {param} failed")
-                exit(-1)
-    return param_types, param_names, raw_params
+def _get_sig_from_headers():
+    sigs = []
+    for header in [
+        CUDA_HEADER,
+        CUDA_EGL_HEADER,
+        CUDA_GL_HEADER,
+        CUDA_PROFILER_HEADER,
+        CUDA_VDPAU_HEADER,
+        # CUDA_DBG_HEADER,
+    ]:
+        sigs.extend(_extract_signatures(header))
+    dic = {}
+    for sig in sigs:
+        if not sig["name"].startswith("cu"):
+            continue
+
+        if sig["name"] == "cuOccupancyMaxPotentialBlockSize":
+            print(sig)
+        if sig["name"] in dic:
+            continue
+        dic[sig["name"]] = sig
+    return dic
 
 
-def gen_cpp_code_for_func(func):
+def _gen_cpp_code_for_func(func_name, all_sigs):
     template = r"""
-HOOK_C_API HOOK_DECL_EXPORT CUresult {FUNC_NAME}({FUNC_ARGS}) {{
-  using func_ptr = CUresult (*)({FUNC_TYPES});
+HOOK_C_API HOOK_DECL_EXPORT {FUNC_RET_TYPE} {FUNC_NAME}({FUNC_ARGS}) {{
+  using func_ptr = {FUNC_RET_TYPE} (*)({FUNC_TYPES});
   static auto func_entry = reinterpret_cast<func_ptr>(HOOK_CUDA_SYMBOL("{FUNC_NAME}"));
   return func_entry({FUNC_ARGUMENTS});
 }}
 """
-    sig_func = func
-    param_info = get_sig_for(sig_func)
-    if param_info is None:
-        # print(f"{sig_func} not found a sig, try remove '_v2' to match sig")
-        sig_func = sig_func.replace("_v2", "")
-        param_info = get_sig_for(sig_func)
+    ori_func_name = func_name
+    if func_name not in all_sigs:
+        func_name = func_name.replace("_v2", "")
 
-    if param_info is None:
-        # print(f"{sig_func} not found a sig, try remove '_ptsz' to match sig")
-        sig_func = sig_func.replace("_ptsz", "")
-        param_info = get_sig_for(sig_func)
+    if func_name not in all_sigs:
+        func_name = func_name.replace("_ptsz", "")
 
-    if param_info is None:
-        # print(f"{sig_func} not found a sig, try remove '_ptds' to match sig")
-        sig_func = sig_func.replace("_ptds", "")
-        param_info = get_sig_for(sig_func)
+    if func_name not in all_sigs:
+        func_name = func_name.replace("_ptds", "")
 
-    if param_info is None:
-        print(f"{func} cpp code not generate. Not found sig in header file.")
+    if func_name not in all_sigs:
+        func_name = func_name.replace("_v3", "")
+
+    if func_name not in all_sigs:
+        print(f"{func_name} cpp code not generate. Not found sig in header file.")
         return None
 
-    (param_types, param_names, raw_params) = param_info
+    func_sig = all_sigs[func_name]
+    func_ret_type = func_sig["return_type"]
+    func_args = []
+    func_types = []
+    func_arguments = []
+    for param in func_sig["params"]:
+        func_args.append(param["type"] + " " + param["name"])
+        func_types.append(param["type"])
+        func_arguments.append(param["name"])
     return template.format(
-        FUNC_NAME=func,
-        FUNC_ARGS=",".join(raw_params),
-        FUNC_TYPES=",".join(param_types),
-        FUNC_ARGUMENTS=",".join(param_names),
+        FUNC_NAME=ori_func_name,
+        FUNC_ARGS=",".join(func_args),
+        FUNC_TYPES=",".join(func_types),
+        FUNC_ARGUMENTS=",".join(func_arguments),
+        FUNC_RET_TYPE=func_ret_type,
     )
 
 
 def main():
-    funcs = get_all_func()
-
     cpp_code = r"""
 #include <cuda.h>
+#include <cudaEGL.h>
+#include <cudaGL.h>
+#include <cudaProfiler.h>
 #include "cuda_hook.h"
-
-#undef cuDeviceTotalMem
-#undef cuCtxCreate
-#undef cuCtxCreate_v3
-#undef cuModuleGetGlobal
-#undef cuMemGetInfo
-#undef cuMemAlloc
-#undef cuMemAllocPitch
-#undef cuMemFree
-#undef cuMemGetAddressRange
-#undef cuMemAllocHost
-#undef cuMemHostGetDevicePointer
-#undef cuMemcpyHtoD
-#undef cuMemcpyDtoH
-#undef cuMemcpyDtoD
-#undef cuMemcpyDtoA
-#undef cuMemcpyAtoD
-#undef cuMemcpyHtoA
-#undef cuMemcpyAtoH
-#undef cuMemcpyAtoA
-#undef cuMemcpyHtoAAsync
-#undef cuMemcpyAtoHAsync
-#undef cuMemcpy2D
-#undef cuMemcpy2DUnaligned
-#undef cuMemcpy3D
-#undef cuMemcpyHtoDAsync
-#undef cuMemcpyDtoHAsync
-#undef cuMemcpyDtoDAsync
-#undef cuMemcpy2DAsync
-#undef cuMemcpy3DAsync
-#undef cuMemsetD8
-#undef cuMemsetD16
-#undef cuMemsetD32
-#undef cuMemsetD2D8
-#undef cuMemsetD2D16
-#undef cuMemsetD2D32
-#undef cuArrayCreate
-#undef cuArrayGetDescriptor
-#undef cuArray3DCreate
-#undef cuArray3DGetDescriptor
-#undef cuTexRefSetAddress
-#undef cuTexRefGetAddress
-#undef cuGraphicsResourceGetMappedPointer
-#undef cuCtxDestroy
-#undef cuCtxPopCurrent
-#undef cuCtxPushCurrent
-#undef cuStreamDestroy
-#undef cuEventDestroy
-#undef cuTexRefSetAddress2D
-#undef cuLinkCreate
-#undef cuLinkAddData
-#undef cuLinkAddFile
-#undef cuMemHostRegister
-#undef cuGraphicsResourceSetMapFlags
-#undef cuStreamBeginCapture
-#undef cuDevicePrimaryCtxRelease
-#undef cuDevicePrimaryCtxReset
-#undef cuDevicePrimaryCtxSetFlags
-#undef cuDeviceGetUuid_v2
-#undef cuIpcOpenMemHandle
-#undef cuGraphInstantiate
-#undef cuGraphExecUpdate                    
-#undef cuGetProcAddress                    
-#undef cuGraphAddKernelNode                
-#undef cuGraphKernelNodeGetParams          
-#undef cuGraphKernelNodeSetParams          
-#undef cuGraphExecKernelNodeSetParams      
-#undef cuStreamWriteValue32
-#undef cuStreamWaitValue32
-#undef cuStreamWriteValue64                
-#undef cuStreamWaitValue64                 
-#undef cuStreamBatchMemOp                  
-#undef cuStreamGetCaptureInfo              
-#undef cuStreamGetCaptureInfo_v2           
 
 #define HOOK_C_API extern "C"
 #define HOOK_DECL_EXPORT __attribute__((visibility("default")))
@@ -192,8 +150,12 @@ private:
 
 #define HOOK_CUDA_SYMBOL(func_name) HookSingleton::GetInstance().GetSymbol(func_name)
 """
+
+    all_sigs = _get_sig_from_headers()
+    funcs = _get_funcs_from_lib()
+
     for func in funcs:
-        code = gen_cpp_code_for_func(func)
+        code = _gen_cpp_code_for_func(func, all_sigs)
         if not code:
             continue
         cpp_code += code
@@ -205,4 +167,3 @@ private:
 
 if __name__ == "__main__":
     main()
-
