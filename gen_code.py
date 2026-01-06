@@ -10,7 +10,7 @@ CUDA_HEADER = "/usr/local/cuda/include/cuda.h"
 CUDA_EGL_HEADER = "/usr/local/cuda/targets/x86_64-linux/include/cudaEGL.h"
 CUDA_GL_HEADER = "/usr/local/cuda/targets/x86_64-linux/include/cudaGL.h"
 CUDA_PROFILER_HEADER = "/usr/local/cuda/targets/x86_64-linux/include/cudaProfiler.h"
-CUDA_VDPAU_HEADER = "/usr/local/cuda/targets/x86_64-linux/include/cudaVDPAU.h"
+# CUDA_VDPAU_HEADER = "/usr/local/cuda/targets/x86_64-linux/include/cudaVDPAU.h"
 # CUDA_DBG_HEADER = "/usr/local/cuda/extras/Debugger/include/cudadebugger.h"
 
 
@@ -23,6 +23,14 @@ def _canonical_func_name(func_name: str) -> str:
 
     if "_v" in func_name:
         return _VERSION_RE.sub("", func_name)
+    return _STREAM_SUFFIX_RE.sub("", func_name)
+
+
+def _canonical_func_name_for_stem(func_name: str) -> str:
+    """
+    map cuMemcpyHtoDAsync_v2_ptsz to cuMemcpyHtoDAsync_v2.
+    """
+    _STREAM_SUFFIX_RE = re.compile(r"_(ptsz|ptds)$")
     return _STREAM_SUFFIX_RE.sub("", func_name)
 
 
@@ -58,8 +66,8 @@ def _extract_signatures(filename) -> List[Dict]:
             }
             signatures.append(func_obj)
 
-            # handle for xx_v2 / xx_v2_ptsz.
-            canonical_func_name = _canonical_func_name(func_name)
+            canonical_func_name = _canonical_func_name_for_stem(func_name)
+
             if canonical_func_name != func_name:
                 canonical_func_obj = {
                     "name": canonical_func_name,
@@ -67,6 +75,22 @@ def _extract_signatures(filename) -> List[Dict]:
                     "params": params,
                 }
                 signatures.append(canonical_func_obj)
+            else:
+                # handle for xx_v2 / xx_v2_ptsz.
+                canonical_func_name = _canonical_func_name(func_name)
+                if canonical_func_name != func_name:
+                    canonical_func_obj = {
+                        "name": canonical_func_name,
+                        "return_type": ret_type,
+                        "params": params,
+                    }
+                    signatures.append(canonical_func_obj)
+
+            # if func_name.startswith("cuStreamGetCaptureInfo"):
+            #     print(
+            #         f"func_name {func_name}, canonical_func_name {canonical_func_name}, {canonical_func_obj}"
+            #     )
+
     return signatures
 
 
@@ -90,7 +114,7 @@ def _get_sig_from_headers():
         CUDA_EGL_HEADER,
         CUDA_GL_HEADER,
         CUDA_PROFILER_HEADER,
-        CUDA_VDPAU_HEADER,
+        # CUDA_VDPAU_HEADER,
         # CUDA_DBG_HEADER,
     ]:
         sigs.extend(_extract_signatures(header))
@@ -116,6 +140,9 @@ HOOK_C_API HOOK_DECL_EXPORT {FUNC_RET_TYPE} {FUNC_NAME}({FUNC_ARGS}) {{
 }}
 """
     ori_func_name = func_name
+    if func_name not in all_sigs:
+        func_name = _canonical_func_name_for_stem(func_name)
+
     if func_name not in all_sigs:
         func_name = _canonical_func_name(func_name)
 
